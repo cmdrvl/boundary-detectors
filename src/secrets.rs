@@ -1,12 +1,22 @@
 use std::sync::OnceLock;
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 use crate::{Finding, Pack, Severity, hash_match};
 
 const HIGH_ENTROPY_THRESHOLD: f64 = 3.5;
+const AWS_KEY_PATTERN: &str = r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b";
+const PEM_KEY_PATTERN: &str = r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----";
+const JWT_PATTERN: &str = r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b";
+const GITHUB_PATTERN: &str =
+    r"\b(?:ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,82})\b";
+const SLACK_PATTERN: &str = r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b";
+const ANTHROPIC_PATTERN: &str = r"\bsk-ant-[A-Za-z0-9_-]{20,}\b";
+const OPENAI_PATTERN: &str = r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b";
+const GENERIC_ASSIGNMENT_PATTERN: &str = r#"(?i)\b(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|private[_-]?key|password|passwd|client[_-]?secret)\b\s*[:=]\s*["']?([A-Za-z0-9+/=._-]{20,})["']?"#;
 
 struct SecretPatterns {
+    candidates: RegexSet,
     aws_key: Regex,
     pem_key: Regex,
     jwt: Regex,
@@ -20,23 +30,26 @@ struct SecretPatterns {
 fn patterns() -> &'static SecretPatterns {
     static PATTERNS: OnceLock<SecretPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| SecretPatterns {
-        aws_key: Regex::new(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b").expect("valid aws_key regex"),
-        pem_key: Regex::new(r"-----BEGIN (?:[A-Z0-9 ]+ )?PRIVATE KEY-----")
-            .expect("valid pem_key regex"),
-        jwt: Regex::new(r"\beyJ[A-Za-z0-9_-]{8,}\.eyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\b")
-            .expect("valid jwt regex"),
-        github: Regex::new(
-            r"\b(?:ghp_[A-Za-z0-9]{36}|gho_[A-Za-z0-9]{36}|github_pat_[A-Za-z0-9_]{22,82})\b",
-        )
-        .expect("valid github regex"),
-        slack: Regex::new(r"\bxox[baprs]-[0-9A-Za-z-]{10,}\b").expect("valid slack regex"),
-        anthropic: Regex::new(r"\bsk-ant-[A-Za-z0-9_-]{20,}\b").expect("valid anthropic regex"),
-        openai: Regex::new(r"\bsk-(?:proj-|svcacct-)?[A-Za-z0-9_-]{20,}\b")
-            .expect("valid openai regex"),
-        generic_assignment: Regex::new(
-            r#"(?i)\b(?:api[_-]?key|secret(?:[_-]?key)?|access[_-]?token|auth[_-]?token|private[_-]?key|password|passwd|client[_-]?secret)\b\s*[:=]\s*["']?([A-Za-z0-9+/=._-]{20,})["']?"#,
-        )
-        .expect("valid generic_assignment regex"),
+        candidates: RegexSet::new([
+            AWS_KEY_PATTERN,
+            PEM_KEY_PATTERN,
+            JWT_PATTERN,
+            GITHUB_PATTERN,
+            SLACK_PATTERN,
+            ANTHROPIC_PATTERN,
+            OPENAI_PATTERN,
+            GENERIC_ASSIGNMENT_PATTERN,
+        ])
+        .expect("valid secret candidate regex set"),
+        aws_key: Regex::new(AWS_KEY_PATTERN).expect("valid aws_key regex"),
+        pem_key: Regex::new(PEM_KEY_PATTERN).expect("valid pem_key regex"),
+        jwt: Regex::new(JWT_PATTERN).expect("valid jwt regex"),
+        github: Regex::new(GITHUB_PATTERN).expect("valid github regex"),
+        slack: Regex::new(SLACK_PATTERN).expect("valid slack regex"),
+        anthropic: Regex::new(ANTHROPIC_PATTERN).expect("valid anthropic regex"),
+        openai: Regex::new(OPENAI_PATTERN).expect("valid openai regex"),
+        generic_assignment: Regex::new(GENERIC_ASSIGNMENT_PATTERN)
+            .expect("valid generic_assignment regex"),
     })
 }
 
@@ -65,6 +78,9 @@ pub fn shannon_entropy(bytes: &[u8]) -> f64 {
 pub fn scan(text: &str, depth: u8) -> Vec<Finding> {
     let p = patterns();
     let mut out = Vec::new();
+    if !p.candidates.is_match(text) {
+        return out;
+    }
 
     let fixed_rules: &[(&Regex, &str, Severity)] = &[
         (&p.aws_key, "SECRET_AWS_ACCESS_KEY", Severity::Critical),

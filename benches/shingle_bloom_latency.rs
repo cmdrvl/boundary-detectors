@@ -1,6 +1,7 @@
 //! Attribute large-payload scan time to the default detectors and the optional
 //! protected-corpus Bloom matcher. Run with
-//! `cargo bench --bench shingle_bloom_latency`.
+//! `cargo bench --bench shingle_bloom_latency`; append `-- --bloom-only` to
+//! profile the 256 KiB Bloom path without the other detector packs.
 
 use std::time::{Duration, Instant};
 
@@ -92,6 +93,14 @@ fn main() {
         filter.clone(),
     );
     let all_with_bloom = Scanner::with_bloom(all_with_bloom_config, filter);
+
+    if std::env::args().any(|arg| arg == "--bloom-only") {
+        let payload = clean_payload(256 * 1024);
+        measure("protected-corpus Bloom only", &payload, || {
+            bloom_only.scan_bytes(&payload)
+        });
+        return;
+    }
 
     for (label, size) in [("4 KiB", 4 * 1024), ("256 KiB", 256 * 1024)] {
         let payload = clean_payload(size);

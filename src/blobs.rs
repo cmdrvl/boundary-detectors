@@ -2,9 +2,14 @@ use std::sync::OnceLock;
 
 use base64::Engine as _;
 use base64::engine::general_purpose::{STANDARD, STANDARD_NO_PAD, URL_SAFE, URL_SAFE_NO_PAD};
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 use crate::{Finding, Pack, Severity, hash_match};
+
+const DATA_URI_PATTERN: &str =
+    r"data:[a-zA-Z0-9.+/-]+(?:;[a-zA-Z0-9=._-]+)*;base64,([A-Za-z0-9+/=_-]{24,})";
+const BASE64_TOKEN_PATTERN: &str = r"[A-Za-z0-9+/_-]{24,}={0,2}";
+const HEX_TOKEN_PATTERN: &str = r"\b(?:[0-9a-fA-F]{2}){16,}\b";
 
 /// A decoded base64 or hex candidate extracted for bounded recursive rescanning.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -14,6 +19,7 @@ pub struct DecodedCandidate {
 }
 
 struct BlobPatterns {
+    candidates: RegexSet,
     data_uri: Regex,
     base64_token: Regex,
     hex_token: Regex,
@@ -22,12 +28,11 @@ struct BlobPatterns {
 fn patterns() -> &'static BlobPatterns {
     static PATTERNS: OnceLock<BlobPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| BlobPatterns {
-        data_uri: Regex::new(
-            r"data:[a-zA-Z0-9.+/-]+(?:;[a-zA-Z0-9=._-]+)*;base64,([A-Za-z0-9+/=_-]{24,})",
-        )
-        .expect("valid data_uri regex"),
-        base64_token: Regex::new(r"[A-Za-z0-9+/_-]{24,}={0,2}").expect("valid base64_token regex"),
-        hex_token: Regex::new(r"\b(?:[0-9a-fA-F]{2}){16,}\b").expect("valid hex_token regex"),
+        candidates: RegexSet::new([DATA_URI_PATTERN, BASE64_TOKEN_PATTERN, HEX_TOKEN_PATTERN])
+            .expect("valid blob candidate regex set"),
+        data_uri: Regex::new(DATA_URI_PATTERN).expect("valid data_uri regex"),
+        base64_token: Regex::new(BASE64_TOKEN_PATTERN).expect("valid base64_token regex"),
+        hex_token: Regex::new(HEX_TOKEN_PATTERN).expect("valid hex_token regex"),
     })
 }
 
@@ -35,6 +40,9 @@ fn patterns() -> &'static BlobPatterns {
 pub fn scan(text: &str, min_len: usize, depth: u8) -> Vec<Finding> {
     let p = patterns();
     let mut out = Vec::new();
+    if !p.candidates.is_match(text) {
+        return out;
+    }
     let effective_min = min_len.max(32);
 
     for m in p.data_uri.find_iter(text) {
@@ -89,6 +97,9 @@ pub fn extract_decodable_candidates(text: &str, max_decoded_bytes: usize) -> Vec
     }
     let p = patterns();
     let mut out = Vec::new();
+    if !p.candidates.is_match(text) {
+        return out;
+    }
     let mut budget = max_decoded_bytes;
 
     for caps in p.data_uri.captures_iter(text) {
@@ -213,4 +224,46 @@ fn is_mostly_printable_text(bytes: &[u8]) -> bool {
         .filter(|&&b| b.is_ascii_graphic() || matches!(b, b' ' | b'\t' | b'\r' | b'\n'))
         .count();
     printable * 10 >= bytes.len() * 8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn blob_candidate_filter_preserves_base64_and_hex_scans() {
+        let secret = b"api_key=q8Z9kL2mN5pR7tV9xY1bC4dF6hJ8";
+        let base64 = STANDARD.encode(secret);
+        let hex = "41".repeat(32);
+        let input = format!("{base64} {hex}");
+
+        let findings = scan(&input, 32, 0);
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "BLOB_BASE64_RUN")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "BLOB_HEX_RUN")
+        );
+
+        let candidates = extract_decodable_candidates(&input, 1024);
+        assert_eq!(candidates.len(), 2);
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.decoded.as_slice() == secret.as_slice())
+        );
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.decoded == vec![b'A'; 32])
+        );
+
+        let ordinary = "ordinary prose with no long encoded runs";
+        assert!(scan(ordinary, 32, 0).is_empty());
+        assert!(extract_decodable_candidates(ordinary, 1024).is_empty());
+    }
 }

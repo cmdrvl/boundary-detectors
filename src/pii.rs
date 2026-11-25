@@ -1,10 +1,18 @@
 use std::sync::OnceLock;
 
-use regex::Regex;
+use regex::{Regex, RegexSet};
 
 use crate::{Finding, Pack, Severity, hash_match};
 
+const SSN_PATTERN: &str = r"\b(\d{3})-(\d{2})-(\d{4})\b";
+const CARD_PATTERN: &str = r"\b(?:\d[ -]?){13,19}\b";
+const EMAIL_PATTERN: &str = r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b";
+const E164_PHONE_PATTERN: &str = r"(?:^|[^0-9A-Za-z])(\+[1-9]\d{6,14})\b";
+const US_PHONE_PATTERN: &str = r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b";
+const IBAN_PATTERN: &str = r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b";
+
 struct PiiPatterns {
+    candidates: RegexSet,
     ssn: Regex,
     card: Regex,
     email: Regex,
@@ -16,15 +24,21 @@ struct PiiPatterns {
 fn patterns() -> &'static PiiPatterns {
     static PATTERNS: OnceLock<PiiPatterns> = OnceLock::new();
     PATTERNS.get_or_init(|| PiiPatterns {
-        ssn: Regex::new(r"\b(\d{3})-(\d{2})-(\d{4})\b").expect("valid ssn regex"),
-        card: Regex::new(r"\b(?:\d[ -]?){13,19}\b").expect("valid card regex"),
-        email: Regex::new(r"\b[A-Za-z0-9._%+-]+@([A-Za-z0-9.-]+\.[A-Za-z]{2,})\b")
-            .expect("valid email regex"),
-        e164_phone: Regex::new(r"(?:^|[^0-9A-Za-z])(\+[1-9]\d{6,14})\b")
-            .expect("valid e164_phone regex"),
-        us_phone: Regex::new(r"\b(?:\+1[-.\s]?)?\(?\d{3}\)?[-.\s]\d{3}[-.\s]\d{4}\b")
-            .expect("valid us_phone regex"),
-        iban: Regex::new(r"\b[A-Z]{2}\d{2}[A-Z0-9]{11,30}\b").expect("valid iban regex"),
+        candidates: RegexSet::new([
+            SSN_PATTERN,
+            CARD_PATTERN,
+            EMAIL_PATTERN,
+            E164_PHONE_PATTERN,
+            US_PHONE_PATTERN,
+            IBAN_PATTERN,
+        ])
+        .expect("valid PII candidate regex set"),
+        ssn: Regex::new(SSN_PATTERN).expect("valid ssn regex"),
+        card: Regex::new(CARD_PATTERN).expect("valid card regex"),
+        email: Regex::new(EMAIL_PATTERN).expect("valid email regex"),
+        e164_phone: Regex::new(E164_PHONE_PATTERN).expect("valid e164_phone regex"),
+        us_phone: Regex::new(US_PHONE_PATTERN).expect("valid us_phone regex"),
+        iban: Regex::new(IBAN_PATTERN).expect("valid iban regex"),
     })
 }
 
@@ -89,6 +103,9 @@ fn is_exempt_domain(domain: &str, exempt_domains: &[String]) -> bool {
 pub fn scan(text: &str, exempt_email_domains: &[String], depth: u8) -> Vec<Finding> {
     let p = patterns();
     let mut out = Vec::new();
+    if !p.candidates.is_match(text) {
+        return out;
+    }
 
     for caps in p.ssn.captures_iter(text) {
         let full = caps.get(0).expect("match 0");
@@ -205,5 +222,6 @@ mod tests {
             .collect();
         assert_eq!(emails.len(), 1);
         assert!(findings.iter().any(|f| f.rule_id == "PII_US_SSN"));
+        assert!(scan("ordinary prose with no personal identifiers", &[], 0).is_empty());
     }
 }
