@@ -1,0 +1,18 @@
+[package]
+name = "boundary-detectors"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Shared deterministic pure-Rust content boundary detectors (secrets, PII, tabular dumps, blobs, paths, magic bytes, and one-way shingle Bloom filters) for CMD+RVL veil and airlock"
+license = "MIT"
+repository = "https://github.com/cmdrvl/boundary-detectors"
+publish = false
+
+[dependencies]
+base64 = "0.22"
+blake3 = "1.8"
+regex = "1.11"
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"
