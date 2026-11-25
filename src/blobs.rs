@@ -26,7 +26,7 @@ fn patterns() -> &'static BlobPatterns {
             r"data:[a-zA-Z0-9.+/-]+(?:;[a-zA-Z0-9=._-]+)*;base64,([A-Za-z0-9+/=_-]{24,})",
         )
         .expect("valid data_uri regex"),
-        base64_token: Regex::new(r"[A-Za-z0-9+/=_-]{24,}").expect("valid base64_token regex"),
+        base64_token: Regex::new(r"[A-Za-z0-9+/_-]{24,}={0,2}").expect("valid base64_token regex"),
         hex_token: Regex::new(r"\b(?:[0-9a-fA-F]{2}){16,}\b").expect("valid hex_token regex"),
     })
 }
