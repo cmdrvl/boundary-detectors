@@ -133,11 +133,16 @@ impl ShingleBloom {
         }
         let normalized = normalize_text(text);
         let mut hits = 0;
-        for_each_shingle(&normalized, self.shingle_words, self.window_bytes, |shingle| {
-            if self.contains_shingle(shingle) {
-                hits += 1;
-            }
-        });
+        for_each_shingle(
+            &normalized,
+            self.shingle_words,
+            self.window_bytes,
+            |shingle| {
+                if self.contains_shingle(shingle) {
+                    hits += 1;
+                }
+            },
+        );
         hits
     }
 
