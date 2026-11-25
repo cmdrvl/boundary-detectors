@@ -17,6 +17,8 @@ pub mod tabular;
 use serde::{Deserialize, Serialize};
 use shingle_bloom::ShingleBloom;
 
+const PARALLEL_COMBINED_SCAN_MIN_BYTES: usize = 128 * 1024;
+
 /// Detector pack categories that can be enabled independently in policy.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -178,33 +180,43 @@ impl Scanner {
         remaining_decoded: &mut usize,
         out: &mut Vec<Finding>,
     ) {
-        let mut level_findings = Vec::new();
+        let bloom_enabled = self.bloom.is_some()
+            && (self.config.has_pack(Pack::ProtectedCorpus) || !self.config.packs.is_empty());
+        let other_packs_enabled = self
+            .config
+            .packs
+            .iter()
+            .any(|pack| *pack != Pack::ProtectedCorpus);
 
-        if self.config.has_pack(Pack::Secrets) {
-            level_findings.extend(secrets::scan(text, depth));
-        }
-        if self.config.has_pack(Pack::Pii) {
-            level_findings.extend(pii::scan(text, &self.config.exempt_email_domains, depth));
-        }
-        if self.config.has_pack(Pack::Tabular) {
-            level_findings.extend(tabular::scan(
-                text,
-                self.config.tabular_min_rows,
-                self.config.tabular_min_columns,
-                depth,
-            ));
-        }
-        if self.config.has_pack(Pack::Blobs) {
-            level_findings.extend(blobs::scan(text, self.config.blob_min_len, depth));
-        }
-        if self.config.has_pack(Pack::Paths) {
-            level_findings.extend(paths::scan(text, depth));
-        }
-        if let Some(bloom) = &self.bloom
-            && (self.config.has_pack(Pack::ProtectedCorpus) || !self.config.packs.is_empty())
+        let mut level_findings = if bloom_enabled
+            && other_packs_enabled
+            && text.len() >= PARALLEL_COMBINED_SCAN_MIN_BYTES
         {
-            level_findings.extend(bloom.scan_text(text, self.config.shingle_min_hits, depth));
-        }
+            let bloom = self
+                .bloom
+                .as_ref()
+                .expect("enabled Bloom filter is present");
+            let min_hits = self.config.shingle_min_hits;
+            std::thread::scope(|scope| {
+                let bloom_worker = std::thread::Builder::new()
+                    .spawn_scoped(scope, || bloom.scan_text(text, min_hits, depth));
+                let mut findings = self.scan_packs(text, depth);
+                match bloom_worker {
+                    Ok(worker) => match worker.join() {
+                        Ok(bloom_findings) => findings.extend(bloom_findings),
+                        Err(_) => findings.extend(bloom.scan_text(text, min_hits, depth)),
+                    },
+                    Err(_) => findings.extend(bloom.scan_text(text, min_hits, depth)),
+                }
+                findings
+            })
+        } else {
+            let mut findings = self.scan_packs(text, depth);
+            if bloom_enabled && let Some(bloom) = &self.bloom {
+                findings.extend(bloom.scan_text(text, self.config.shingle_min_hits, depth));
+            }
+            findings
+        };
 
         if let Some(span) = outer_span {
             for finding in &mut level_findings {
@@ -228,6 +240,74 @@ impl Scanner {
                 }
             }
         }
+    }
+
+    fn scan_packs(&self, text: &str, depth: u8) -> Vec<Finding> {
+        let mut findings = Vec::new();
+
+        if self.config.has_pack(Pack::Secrets) {
+            findings.extend(secrets::scan(text, depth));
+        }
+        if self.config.has_pack(Pack::Pii) {
+            findings.extend(pii::scan(text, &self.config.exempt_email_domains, depth));
+        }
+        if self.config.has_pack(Pack::Tabular) {
+            findings.extend(tabular::scan(
+                text,
+                self.config.tabular_min_rows,
+                self.config.tabular_min_columns,
+                depth,
+            ));
+        }
+        if self.config.has_pack(Pack::Blobs) {
+            findings.extend(blobs::scan(text, self.config.blob_min_len, depth));
+        }
+        if self.config.has_pack(Pack::Paths) {
+            findings.extend(paths::scan(text, depth));
+        }
+
+        findings
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use shingle_bloom::BloomConfig;
+
+    #[test]
+    fn large_combined_scan_keeps_bloom_and_detector_findings_deterministic() {
+        let protected_text = "protected corpus document words should match copied passages safely across the detector boundary";
+        let mut bloom = ShingleBloom::new(BloomConfig {
+            expected_shingles: 1_000,
+            false_positive_rate: 0.001,
+            ..BloomConfig::default()
+        });
+        bloom.insert_text(protected_text);
+
+        let filler = "steady quiet review window signal record answer change branch sample memory writer reader ".repeat(3_000);
+        let input = format!("aws=AKIAIOSFODNN7EXAMPLE ssn=123-45-6789 {filler} {protected_text}");
+        assert!(input.len() >= PARALLEL_COMBINED_SCAN_MIN_BYTES);
+
+        let mut config = ScanConfig::default();
+        config.packs.push(Pack::ProtectedCorpus);
+        let scanner = Scanner::with_bloom(config, bloom);
+
+        let findings = scanner.scan_str(&input);
+        assert!(findings.iter().any(|finding| {
+            finding.pack == Pack::ProtectedCorpus && finding.rule_id == "PROTECTED_CORPUS_MATCH"
+        }));
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "SECRET_AWS_ACCESS_KEY")
+        );
+        assert!(
+            findings
+                .iter()
+                .any(|finding| finding.rule_id == "PII_US_SSN")
+        );
+        assert_eq!(findings, scanner.scan_str(&input));
     }
 }
 
