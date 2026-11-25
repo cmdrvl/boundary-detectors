@@ -108,7 +108,9 @@ impl ShingleBloom {
     /// Insert all normalized word-shingles and sliding byte-windows from `text`.
     pub fn insert_text(&mut self, text: &str) {
         let normalized = normalize_text(text);
-        self.for_each_shingle(&normalized, |shingle| {
+        let shingle_words = self.shingle_words;
+        let window_bytes = self.window_bytes;
+        for_each_shingle(&normalized, shingle_words, window_bytes, |shingle| {
             self.insert_shingle(shingle);
         });
     }
@@ -131,7 +133,7 @@ impl ShingleBloom {
         }
         let normalized = normalize_text(text);
         let mut hits = 0;
-        self.for_each_shingle(&normalized, |shingle| {
+        for_each_shingle(&normalized, self.shingle_words, self.window_bytes, |shingle| {
             if self.contains_shingle(shingle) {
                 hits += 1;
             }
@@ -258,36 +260,41 @@ impl ShingleBloom {
         let h2 = u64::from_le_bytes(bytes[8..16].try_into().expect("8 bytes")) | 1;
         (h1, h2)
     }
+}
 
-    fn for_each_shingle<F: FnMut(&[u8])>(&self, normalized: &str, mut f: F) {
-        let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
-        let w = usize::from(self.shingle_words);
-        if words.len() >= w {
-            let mut joined = String::new();
-            for win in words.windows(w) {
-                joined.clear();
-                for (idx, word) in win.iter().enumerate() {
-                    if idx > 0 {
-                        joined.push(' ');
-                    }
-                    joined.push_str(word);
+fn for_each_shingle<F: FnMut(&[u8])>(
+    normalized: &str,
+    shingle_words: u8,
+    window_bytes: u8,
+    mut f: F,
+) {
+    let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
+    let w = usize::from(shingle_words);
+    if words.len() >= w {
+        let mut joined = String::new();
+        for win in words.windows(w) {
+            joined.clear();
+            for (idx, word) in win.iter().enumerate() {
+                if idx > 0 {
+                    joined.push(' ');
                 }
-                if joined.len() >= 24 {
-                    f(joined.as_bytes());
-                }
+                joined.push_str(word);
+            }
+            if joined.len() >= 24 {
+                f(joined.as_bytes());
             }
         }
+    }
 
-        // Also emit sliding byte windows for compact non-whitespace rows (CSV/JSONL).
-        let raw = normalized.as_bytes();
-        let win_len = usize::from(self.window_bytes);
-        if raw.len() >= win_len {
-            let stride = (win_len / 4).max(8);
-            let mut offset = 0;
-            while offset + win_len <= raw.len() {
-                f(&raw[offset..offset + win_len]);
-                offset += stride;
-            }
+    // Also emit sliding byte windows for compact non-whitespace rows (CSV/JSONL).
+    let raw = normalized.as_bytes();
+    let win_len = usize::from(window_bytes);
+    if raw.len() >= win_len {
+        let stride = (win_len / 4).max(8);
+        let mut offset = 0;
+        while offset + win_len <= raw.len() {
+            f(&raw[offset..offset + win_len]);
+            offset += stride;
         }
     }
 }
