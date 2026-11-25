@@ -1,6 +1,6 @@
 use crate::{Finding, Pack, Severity, hash_match};
 
-const DELIMITERS: [u8; 4] = [b',', b'\t', b'|', b';'];
+const DELIMITERS: [u8; 4] = *b",\t|;";
 
 /// Scan `text` for delimited tabular blocks (`>= min_rows` consecutive
 /// non-empty lines sharing the same delimiter count `>= min_columns - 1`).
