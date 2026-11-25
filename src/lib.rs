@@ -222,13 +222,7 @@ impl Scanner {
                 *remaining_decoded -= candidate.decoded.len();
                 let decoded_text = String::from_utf8_lossy(&candidate.decoded);
                 let span = outer_span.unwrap_or(candidate.outer_span);
-                self.scan_level(
-                    &decoded_text,
-                    depth + 1,
-                    Some(span),
-                    remaining_decoded,
-                    out,
-                );
+                self.scan_level(&decoded_text, depth + 1, Some(span), remaining_decoded, out);
                 if *remaining_decoded == 0 {
                     break;
                 }

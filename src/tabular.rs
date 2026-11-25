@@ -22,14 +22,7 @@ pub fn scan(text: &str, min_rows: usize, min_columns: usize, depth: u8) -> Vec<F
             let line = text[start..end].trim();
             if line.is_empty() {
                 flush_run(
-                    text,
-                    delim,
-                    min_rows,
-                    run_start,
-                    run_end,
-                    run_count,
-                    depth,
-                    &mut out,
+                    text, delim, min_rows, run_start, run_end, run_count, depth, &mut out,
                 );
                 run_start = None;
                 run_count = 0;
@@ -43,14 +36,7 @@ pub fn scan(text: &str, min_rows: usize, min_columns: usize, depth: u8) -> Vec<F
                     run_count += 1;
                 } else {
                     flush_run(
-                        text,
-                        delim,
-                        min_rows,
-                        run_start,
-                        run_end,
-                        run_count,
-                        depth,
-                        &mut out,
+                        text, delim, min_rows, run_start, run_end, run_count, depth, &mut out,
                     );
                     run_start = Some(start);
                     run_end = end;
@@ -59,14 +45,7 @@ pub fn scan(text: &str, min_rows: usize, min_columns: usize, depth: u8) -> Vec<F
                 }
             } else {
                 flush_run(
-                    text,
-                    delim,
-                    min_rows,
-                    run_start,
-                    run_end,
-                    run_count,
-                    depth,
-                    &mut out,
+                    text, delim, min_rows, run_start, run_end, run_count, depth, &mut out,
                 );
                 run_start = None;
                 run_count = 0;
@@ -74,14 +53,7 @@ pub fn scan(text: &str, min_rows: usize, min_columns: usize, depth: u8) -> Vec<F
         }
 
         flush_run(
-            text,
-            delim,
-            min_rows,
-            run_start,
-            run_end,
-            run_count,
-            depth,
-            &mut out,
+            text, delim, min_rows, run_start, run_end, run_count, depth, &mut out,
         );
     }
 
