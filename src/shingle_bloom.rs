@@ -6,6 +6,8 @@ const MAGIC: [u8; 4] = *b"BDBL";
 const FORMAT_VERSION: u8 = 1;
 const HEADER_LEN: usize = 40;
 const MAX_BITS: u64 = 64 * 1024 * 1024 * 8; // 64 MiB max bitset
+const PARALLEL_SCAN_MIN_BYTES: usize = 128 * 1024;
+const MAX_SCAN_WORKERS: usize = 8;
 
 /// Configuration for building a one-way protected-corpus shingle Bloom filter.
 #[derive(Debug, Clone, PartialEq)]
@@ -82,7 +84,9 @@ impl ShingleBloom {
         let fpr = config.false_positive_rate.clamp(1e-6, 0.25);
         let ln2 = std::f64::consts::LN_2;
         let m_raw = (-(n * fpr.ln()) / (ln2 * ln2)).ceil() as u64;
-        let m_bits = m_raw.clamp(1024, MAX_BITS).div_ceil(8) * 8;
+        // A power-of-two bit count lets membership checks use a mask instead
+        // of an integer remainder for every shingle hash.
+        let m_bits = m_raw.clamp(1024, MAX_BITS).next_power_of_two();
         let k = (((m_bits as f64) / n) * ln2).round().clamp(2.0, 16.0) as u8;
         let byte_len = usize::try_from(m_bits / 8).expect("m_bits fits in usize");
 
@@ -132,9 +136,19 @@ impl ShingleBloom {
             return 0;
         }
         let normalized = normalize_text(text);
+        if normalized.len() >= PARALLEL_SCAN_MIN_BYTES {
+            let workers = std::thread::available_parallelism()
+                .map(|parallelism| parallelism.get().min(MAX_SCAN_WORKERS))
+                .unwrap_or(1);
+            return self.count_hits_parallel(&normalized, workers);
+        }
+        self.count_hits_serial(&normalized)
+    }
+
+    fn count_hits_serial(&self, normalized: &str) -> usize {
         let mut hits = 0;
         for_each_shingle(
-            &normalized,
+            normalized,
             self.shingle_words,
             self.window_bytes,
             |shingle| {
@@ -144,6 +158,48 @@ impl ShingleBloom {
             },
         );
         hits
+    }
+
+    fn count_shingles(&self, shingles: &[&[u8]]) -> usize {
+        shingles
+            .iter()
+            .filter(|shingle| self.contains_shingle(shingle))
+            .count()
+    }
+
+    fn count_hits_parallel(&self, normalized: &str, workers: usize) -> usize {
+        let mut shingles = Vec::with_capacity(normalized.len() / 4);
+        for_each_shingle(
+            normalized,
+            self.shingle_words,
+            self.window_bytes,
+            |shingle| shingles.push(shingle),
+        );
+        if shingles.is_empty() {
+            return 0;
+        }
+        if workers <= 1 {
+            return self.count_shingles(&shingles);
+        }
+
+        let chunk_count = workers.min(shingles.len());
+        let chunk_size = shingles.len().div_ceil(chunk_count);
+        std::thread::scope(|scope| {
+            let mut handles = Vec::with_capacity(chunk_count);
+            let mut hits = 0;
+            for chunk in shingles.chunks(chunk_size) {
+                match std::thread::Builder::new()
+                    .spawn_scoped(scope, move || self.count_shingles(chunk))
+                {
+                    Ok(handle) => handles.push((chunk, handle)),
+                    Err(_) => hits += self.count_shingles(chunk),
+                }
+            }
+            for (chunk, handle) in handles {
+                hits += handle.join().unwrap_or_else(|_| self.count_shingles(chunk));
+            }
+            hits
+        })
     }
 
     /// Return `true` if `text` produces at least `min_hits` shingle hits.
@@ -233,23 +289,49 @@ impl ShingleBloom {
 
     fn insert_shingle(&mut self, shingle: &[u8]) {
         let (h1, h2) = self.double_hash(shingle);
-        for i in 0..u64::from(self.k_hashes) {
-            let bit_idx = h1.wrapping_add(i.wrapping_mul(h2)) % self.m_bits;
-            let byte_idx = (bit_idx / 8) as usize;
-            let mask = 1u8 << (bit_idx % 8);
-            self.bits[byte_idx] |= mask;
+        let bit_mask = self.m_bits - 1;
+        if self.m_bits.is_power_of_two() {
+            let mut bit_idx = h1 & bit_mask;
+            let step = h2 & bit_mask;
+            for _ in 0..self.k_hashes {
+                let byte_idx = (bit_idx / 8) as usize;
+                let bit = 1u8 << (bit_idx % 8);
+                self.bits[byte_idx] |= bit;
+                bit_idx = bit_idx.wrapping_add(step) & bit_mask;
+            }
+        } else {
+            for i in 0..u64::from(self.k_hashes) {
+                let bit_idx = h1.wrapping_add(i.wrapping_mul(h2)) % self.m_bits;
+                let byte_idx = (bit_idx / 8) as usize;
+                let bit = 1u8 << (bit_idx % 8);
+                self.bits[byte_idx] |= bit;
+            }
         }
         self.inserted_shingles = self.inserted_shingles.saturating_add(1);
     }
 
     fn contains_shingle(&self, shingle: &[u8]) -> bool {
         let (h1, h2) = self.double_hash(shingle);
-        for i in 0..u64::from(self.k_hashes) {
-            let bit_idx = h1.wrapping_add(i.wrapping_mul(h2)) % self.m_bits;
-            let byte_idx = (bit_idx / 8) as usize;
-            let mask = 1u8 << (bit_idx % 8);
-            if self.bits[byte_idx] & mask == 0 {
-                return false;
+        let bit_mask = self.m_bits - 1;
+        if self.m_bits.is_power_of_two() {
+            let mut bit_idx = h1 & bit_mask;
+            let step = h2 & bit_mask;
+            for _ in 0..self.k_hashes {
+                let byte_idx = (bit_idx / 8) as usize;
+                let bit = 1u8 << (bit_idx % 8);
+                if self.bits[byte_idx] & bit == 0 {
+                    return false;
+                }
+                bit_idx = bit_idx.wrapping_add(step) & bit_mask;
+            }
+        } else {
+            for i in 0..u64::from(self.k_hashes) {
+                let bit_idx = h1.wrapping_add(i.wrapping_mul(h2)) % self.m_bits;
+                let byte_idx = (bit_idx / 8) as usize;
+                let bit = 1u8 << (bit_idx % 8);
+                if self.bits[byte_idx] & bit == 0 {
+                    return false;
+                }
             }
         }
         true
@@ -267,32 +349,46 @@ impl ShingleBloom {
     }
 }
 
-fn for_each_shingle<F: FnMut(&[u8])>(
-    normalized: &str,
+fn for_each_shingle<'a, F: FnMut(&'a [u8])>(
+    normalized: &'a str,
     shingle_words: u8,
     window_bytes: u8,
     mut f: F,
 ) {
-    let words: Vec<&str> = normalized.split(' ').filter(|w| !w.is_empty()).collect();
     let w = usize::from(shingle_words);
-    if words.len() >= w {
-        let mut joined = String::new();
-        for win in words.windows(w) {
-            joined.clear();
-            for (idx, word) in win.iter().enumerate() {
-                if idx > 0 {
-                    joined.push(' ');
-                }
-                joined.push_str(word);
-            }
-            if joined.len() >= 24 {
-                f(joined.as_bytes());
+    let raw = normalized.as_bytes();
+    let mut word_starts = [0usize; 255];
+    let mut next = 0;
+    let mut words_seen = 0;
+    let mut add_word = |start, end| {
+        word_starts[next] = start;
+        next += 1;
+        if next == w {
+            next = 0;
+        }
+        words_seen = (words_seen + 1).min(w);
+        if words_seen == w {
+            let shingle_start = word_starts[next];
+            if end - shingle_start >= 24 {
+                f(&raw[shingle_start..end]);
             }
         }
+    };
+    let mut word_start = None;
+    for (idx, byte) in raw.iter().enumerate() {
+        if *byte == b' ' {
+            if let Some(start) = word_start.take() {
+                add_word(start, idx);
+            }
+        } else if word_start.is_none() {
+            word_start = Some(idx);
+        }
+    }
+    if let Some(start) = word_start {
+        add_word(start, raw.len());
     }
 
     // Also emit sliding byte windows for compact non-whitespace rows (CSV/JSONL).
-    let raw = normalized.as_bytes();
     let win_len = usize::from(window_bytes);
     if raw.len() >= win_len {
         let stride = (win_len / 4).max(8);
@@ -330,9 +426,10 @@ mod tests {
 
     #[test]
     fn roundtrip_and_zero_raw_text_in_serialized_bytes() {
-        let secret_memo = "Project Orion confidential acquisition target valuation forty-two million dollars in mezzanine tranche B";
+        let protected_source = "Project Orion confidential acquisition target valuation forty-two million dollars in mezzanine tranche B";
         let mut bloom = ShingleBloom::new(BloomConfig::default());
-        bloom.insert_text(secret_memo);
+        assert!(bloom.bit_len().is_power_of_two());
+        bloom.insert_text(protected_source);
         let serialized = bloom.to_bytes();
 
         // Serialized filter must never contain raw substrings of the source text.
@@ -348,5 +445,53 @@ mod tests {
             "fn main() { println!(\"hello world from normal rust source code\"); }",
             2
         ));
+    }
+
+    #[test]
+    fn non_power_of_two_serialized_filters_keep_the_legacy_index_path() {
+        let mut bloom = ShingleBloom::new(BloomConfig {
+            expected_shingles: 1_000,
+            false_positive_rate: 0.01,
+            ..BloomConfig::default()
+        });
+        // This is the v1 size and hash count for the configuration above.
+        bloom.m_bits = 9_592;
+        bloom.k_hashes = 7;
+        bloom
+            .bits
+            .truncate(usize::try_from(bloom.m_bits / 8).expect("test size fits"));
+        let phrase =
+            "legacy serialized filter payload preserves the original salted bloom index mapping";
+        let probe = &phrase.as_bytes()[..64];
+        let (h1, h2) = bloom.double_hash(probe);
+        for i in 0..u64::from(bloom.k_hashes) {
+            let bit_idx = h1.wrapping_add(i.wrapping_mul(h2)) % bloom.m_bits;
+            let byte_idx = usize::try_from(bit_idx / 8).expect("test size fits");
+            let bit = 1u8 << (bit_idx % 8);
+            bloom.bits[byte_idx] |= bit;
+        }
+        bloom.inserted_shingles = 1;
+
+        let legacy = ShingleBloom::from_bytes(&bloom.to_bytes()).expect("valid legacy filter");
+        assert_eq!(legacy.bit_len(), 9_592);
+        assert!(legacy.matches(phrase, 1));
+    }
+
+    #[test]
+    fn parallel_scan_preserves_serial_hit_counts() {
+        let protected_text =
+            "project orion confidential acquisition target valuation forty two million dollars";
+        let mut bloom = ShingleBloom::new(BloomConfig::default());
+        bloom.insert_text(protected_text);
+
+        let mut text = "alpha beta gamma delta epsilon zeta eta theta ".repeat(4_000);
+        text.push_str(protected_text);
+        let normalized = normalize_text(&text);
+        assert!(normalized.len() >= PARALLEL_SCAN_MIN_BYTES);
+
+        let serial_hits = bloom.count_hits_serial(&normalized);
+        let parallel_hits = bloom.count_hits_parallel(&normalized, 4);
+        assert!(parallel_hits > 0);
+        assert_eq!(parallel_hits, serial_hits);
     }
 }
